@@ -1,0 +1,6 @@
+# Local and generated files
+*.zip
+*.log
+.env
+__pycache__/
+*.pyc
