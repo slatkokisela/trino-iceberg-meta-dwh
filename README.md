@@ -1,71 +1,138 @@
-# Trino Usage Meta DWH — Proposed Model and Reference Implementation
+# Trino Usage Meta DWH
 
-## Scope
+A reference design for analyzing historical Trino query usage with Apache Iceberg. It is intended to answer three questions:
 
-This package is a reference design for historical Trino usage reporting over Iceberg. It includes schema DDL, a raw-event adapter template, batch validation, a current-state fact upsert, checkpoint advancement, and example analytics SQL. The raw-event schema, catalog configuration, and target cluster were not supplied; the SQL has not been executed against that deployment.
+- **Table usage:** Which authenticated principals accessed a table, and how did that change over time?
+
+- **Team resource consumption:** How much CPU and I/O can be attributed to each workload team?
+
+- **Historical changes:** How should reports handle late events, corrected query metadata, and changing workload ownership?
+
+The key modeling choice is to store resource metrics once per query execution and expose table accesses separately. A query may touch several tables, but its CPU and I/O belong to the execution as a whole and must not be counted once per table.
+
+
+## Architecture
+
+```mermaid
+flowchart TD
+    S[Trino completion and table-access events] --> N[Source-specific normalization]
+    N --> E[meta_staging.query_events]
+    E --> C[meta_staging.v_canonical_events]
+    C --> V[Batch preflight and revision validation]
+    V --> F[meta_core.fact_query_execution]
+    M[meta_ops.workload_team_map] -->|Effective-dated team attribution| F
+    F --> A[meta_core.v_query_table_access]
+    F --> R[Team resource and historical reporting]
+    A --> U[Table usage reporting]
+    V --> P[Post-write checks]
+    F --> P
+    P --> K[meta_ops.pipeline_checkpoint]
+```
+
+The `iceberg` prefix in the SQL is an example Trino catalog. Within it, `meta_staging` contains incoming data, `meta_core` contains reporting objects, and `meta_ops` contains pipeline metadata.
 
 ## Data model
 
-| Object | Grain | Purpose |
-|---|---|---|
-| `meta_staging.query_events` | One delivered query-event revision; replays may repeat it. | Append-only normalized input with batch and source provenance. The logical revision key is `(cluster_id, query_id, event_version)`. |
-| `meta_staging.v_canonical_events` | One canonicalized representation per delivered event row. | Sorts/deduplicates access entries and computes the versioned payload hash used by conflict checks. It does not choose a winning revision. |
-| `meta_ops.workload_team_map` | One effective-dated workload/team assignment. | Resolves the responsible workload team at execution time. Intervals are half-open; `valid_to` is exclusive and NULL means open-ended. |
-| `meta_core.fact_query_execution` | One current row per `(cluster_id, query_id)`. | Holds the latest accepted revision, resource measures, user, workload/team attribution, access list, and provenance. Iceberg does not enforce the logical key. |
-| `meta_core.v_query_table_access` | One query/table/role row. | Read-time `UNNEST` of the current fact's access array. It is not a second physical fact table. |
-| `meta_ops.pipeline_checkpoint` | One row per pipeline. | Highest contiguous batch sequence fully validated and published. The runner must enforce uniqueness and serialize publishers. |
+| Object | Logical grain | Responsibility |
+| --- | --- | --- |
+| `meta_staging.query_events` | One delivered event revision; replays are allowed. | Preserves normalized input, event versions, source references, timestamps, measures, and access metadata. |
+| `meta_staging.v_canonical_events` | One canonical representation per delivered row. | Normalizes terminal state, sorts and deduplicates accesses, and calculates a versioned payload hash. |
+| `meta_ops.workload_team_map` | One effective-dated workload/team assignment. | Preserves workload ownership intervals and mapping versions. |
+| `meta_core.fact_query_execution` | One current row per `(cluster_id, query_id)`. | Stores accepted query metrics, the latest revision, access list, resolved team, and provenance. |
+| `meta_core.v_query_table_access` | One query/table/access-role row. | Expands accesses for table-level reporting without duplicating stored measures. |
+| `meta_ops.pipeline_checkpoint` | One row per pipeline. | Tracks the highest contiguous batch validated and published. |
 
-A table-owner dimension is optional for these questions. If added, distinguish data ownership from compute-consuming team attribution.
+A table-owner dimension is not required for these metrics. Dataset ownership and responsibility for query compute are different concepts. Add a separate table metadata dimension only if ownership or classification becomes a reporting requirement.
 
-## Metric and mapping assumptions
+## Tables and views explained
 
-- **Identity:** `(cluster_id, query_id)` represents one execution attempt. Retries with different query IDs count separately. A higher authoritative `event_version` replaces the current fact; same-version/different-payload events are rejected.
-- **Users:** `user_id` is a stable authenticated principal, not necessarily a person. The example counts distinct non-null principals observed in successful (`FINISHED`) reads. Service accounts count as principals. Partial access metadata can make this an undercount.
-- **Teams:** `workload_id` is resolved through the effective-dated mapping at query end time. This attributes compute to the responsible workload team, not the user's employer/team. Unmapped workloads remain NULL; no team is guessed. The fact stores `team_mapping_id` and `team_mapping_version`, while the mapping table retains effective-date history.
-- **Multiple sources/tables:** Normalize completion and table-access sources by stable query identity before writing staging. A query may access many tables and may both read and write one table. Its resource measures remain on the single execution row and are not apportioned across tables. Do not aggregate CPU after joining the access view.
-- **Access completeness:** `accesses_complete=true` means the list is complete, including a known empty list; `false` means partial; NULL means unknown. Observed access counts should be interpreted with a separate coverage measure.
-- **Resources:** CPU milliseconds and physical input bytes are additive across executions. Peak memory is a per-execution peak; report `MAX` or a distribution, never a sum. NULL means unavailable, not zero. Resource totals include `FINISHED`, `FAILED`, and `CANCELED` executions because all may consume resources; table-user examples count only `FINISHED` reads.
-- **Time and names:** Timestamps are normalized to UTC and stored as `TIMESTAMP(6)` without time zone in this example. Periods are half-open `[start, end)`. Preserve quoted/case-sensitive table identity where the source distinguishes it.
+### `meta_staging.query_events`: incoming query-event history
 
-## Hash and replay contract
+One row represents a delivered revision of a Trino query-completion event. The execution is identified by `(cluster_id, query_id)` and `event_version` identifies the revision. The row also contains `user_id`, `workload_id`, query state, start and end times, CPU, I/O and memory measures, and table accesses. Batch IDs, source references, and ingestion and normalization fields provide lineage.
 
-`v_canonical_events` canonicalizes the access array and hashes the business payload: cluster/query identity, normalization version, workload/user, start/end time, terminal state, resource measures, access-completeness flag, and canonical accesses. Ingestion must normalize roles to uppercase `READ`/`WRITE`. Batch IDs, delivery references, ingestion timestamps, and source Trino version are provenance and are excluded from the hash. A change to any hashed field at the same event version is a conflict.
+Ingestion does not overwrite earlier deliveries when a retry or correction arrives. Staging can therefore contain repeated deliveries of the same revision. A staging row is not necessarily a distinct query. The table is partitioned by `ingestion_batch_seq` for batch processing.
 
-Hash contract `trino-483-row-json-v1` assumes Trino 483 and `deprecated.legacy-row-to-json-cast=false`. Keep the engine/session behavior pinned for this contract; `hash_contract_version` is persisted with the fact and checked by preflight. Do not silently change the serialization or canonicalization. A change requires a planned, tested historical rebuild and reconciliation. If the target cannot pin these settings, compute the hash in a versioned normalizer using a stable serialization and replace the view hash expression accordingly.
+`accesses` is an array of rows containing `catalog_name`, `schema_name`, `table_name`, and `access_role`. A query that reads two tables has two entries in the array, but its resource measures are still stored only once.
 
-## Ingestion contract
+### `meta_staging.v_canonical_events`: comparable event payloads
 
-The upstream normalizer writes the columns defined in `meta_staging.query_events`. It assigns immutable batch ID and monotonic sequence, stable source event reference, authoritative event version, normalization version, source Trino version when available, and UTC timestamps. It maps raw states and resource units, joins separate access events by stable query identity, and marks incomplete access metadata honestly. The adapter in `sql/00b_ingest_adapter_template.sql` is a placeholder because actual source fields were not supplied.
+This view uppercases the terminal query state, sorts and deduplicates access entries, and calculates `payload_hash` with a `hash_contract_version`. It preserves the event identifiers and provenance needed by validation and transformation.
 
-The team map is maintained separately from query events. Validate that no workload has overlapping validity intervals at a query's execution time. If source metadata already provides authoritative team attribution, it may be loaded directly instead, but retain its attribution source and historical version.
+Preflight compares hashes to identify different payloads claiming the same `(cluster_id, query_id, event_version)`. The view does not select the latest revision or remove repeated deliveries. Those decisions are made by validation and publishing.
 
-## Publish sequence
+### `meta_ops.workload_team_map`: historical workload ownership
 
-1. Run `sql/00_schema.sql` once in a disposable catalog. It creates the model and seeds a zero checkpoint only if absent. Do not reset an existing checkpoint.
-2. Load approved team mappings and append one normalized batch. Never update delivered staging rows in place.
-3. Run `sql/01_preflight.sql` after substituting `__BATCH_SEQ__`. Stop if it returns any rows. It checks required fields, event states, measures, mappings, access roles, canonical payload conflicts across deliveries, conflicts with the current fact, duplicate target keys, and contiguous batch sequence.
-4. Run `sql/02_transform.sql` with the same sequence after preflight has passed. The merge selects the highest revision per execution in the batch and updates only when its version is greater than the current fact version. An identical replay is a no-op only after conflict checks pass.
-5. Run `sql/05_post_write_checks.sql`; reconcile counts/versions and confirm it returns no violations. Do not checkpoint a failed or unreconciled batch.
-6. Run `sql/03_advance_checkpoint.sql` with the sequence and batch ID. Confirm exactly one row was updated.
+Each row assigns a `workload_id` to a `team_id` for an effective-dated interval. `valid_from` is inclusive, `valid_to` is exclusive, and NULL `valid_to` means there is no specified end date. The row also records a mapping ID and version.
 
-The checkpoint table has no enforced primary key or compare-and-set guarantee. The external runner must enforce exactly one row per `pipeline_id` and serialize publishers using a lock/lease (or equivalent). The sequence predicate guards against a stale update, but it does not replace that coordination. SQL preflight returns rows rather than aborting the run; the runner must inspect the result and stop on violations.
+The user or service that submits a query may not be part of the team responsible for its compute usage. The publisher resolves the mapping valid at query end time and stores the selected team and mapping identifiers in the fact. Overlapping mappings are rejected. If no mapping exists, the team remains unknown rather than being guessed.
 
-## History and operations
+### `meta_core.fact_query_execution`: current corrected execution facts
 
-The fact is current corrected state, not a bitemporal audit. A correction can change the event day, team, measures, or access list, so recalculated past-period results may change. Validate that the target Iceberg connector correctly handles updates that move the partition key. Late events arrive in a new batch but are attributed to execution time. A retroactive team-map change does not automatically rewrite existing facts; rebuild or explicitly correct affected facts and retain the new mapping version.
+This is the main physical reporting table, designed for one current row per `(cluster_id, query_id)`. It stores the highest accepted event version, query state, user, workload, resolved team, timestamps, `event_day`, CPU, physical input bytes, peak memory, access completeness, and the canonical access array. Source batch and publication fields show where the current row came from. The table is partitioned by `event_day` for time-based reporting.
 
-For “as published” reports, snapshot the aggregates or add a bitemporal/audit table. Transformation-rule changes require rebuilding affected data from retained events under a documented version and reconciling before cutover; an unchanged event version will not rerun under new logic.
+The resource measures describe the whole execution, not individual tables. Storing them once at query grain lets team reports aggregate usage without multiplying it by the number of accesses. A newer authoritative revision replaces the current metrics and access list together through `MERGE`.
 
-Before production, test duplicate deliveries, conflicting same-version payloads, higher-version corrections, canceled/failed executions, partial access data, unmapped workloads, checkpoint retry, hash-contract upgrade, and partition movement against a disposable deployment. Add least-privilege access, identity protection, retention, audit, monitoring, alerting, and an operational owner.
+The fact represents current corrected history, not every delivered revision or a record of what a dashboard showed in the past. A correction can change an earlier period's results. Iceberg does not enforce the logical execution key, so the publisher must validate uniqueness and prevent concurrent writers.
 
-## Files
+### `meta_core.v_query_table_access`: table-level access view
 
-- `sql/00_schema.sql` — schemas, staging and fact tables, canonical hash view, team map, checkpoint, access view.
-- `sql/00b_ingest_adapter_template.sql` — placeholder source adapter.
-- `sql/00c_team_mapping_example.sql` — illustrative effective-dated team assignment.
-- `sql/01_preflight.sql` — batch and revision-conflict checks; replace `__BATCH_SEQ__`.
-- `sql/02_transform.sql` — current-state fact `MERGE`; replace `__BATCH_SEQ__`.
-- `sql/03_advance_checkpoint.sql` — guarded checkpoint update; replace `__BATCH_SEQ__` and `__BATCH_ID__`.
-- `sql/04_analytics_examples.sql` — user, resource, coverage, and trend queries.
-- `sql/05_post_write_checks.sql` — uniqueness and revision reconciliation; replace `__BATCH_SEQ__`.
-- `model.mmd` — model flow diagram source.
+This view expands the fact's `accesses` array with `UNNEST`, producing one row per query, catalog, schema, table, and access role. It also exposes execution context such as user, team, state, date, and access completeness.
+
+Use it for questions such as “How many distinct principals read `orders` last month?” A query with no access entries produces no rows in this view, but remains in the fact table. Do not sum CPU or I/O after expanding accesses. Incomplete access metadata also means table-user counts represent observed usage, not necessarily total usage.
+
+The view avoids maintaining a second physical access table. If table-access reporting becomes a performance bottleneck, a materialized access table is an option, but it would need its own correction and consistency process.
+
+### `meta_ops.pipeline_checkpoint`: validated publication progress
+
+This table stores one logical record per `pipeline_id`, including `last_batch_seq`, `last_batch_id`, and `updated_at`. A new installation starts the `trino_usage` pipeline at sequence zero if no checkpoint exists.
+
+The publisher advances the checkpoint only after the fact `MERGE` and post-write checks pass. Fact and checkpoint writes are separate operations. If the fact update succeeds but checkpoint advancement fails, reconcile and retry the same sequence. Iceberg does not enforce checkpoint uniqueness or single-writer coordination, so the external runner must enforce both.
+
+## Reporting semantics
+
+The examples in [`sql/04_analytics_examples.sql`](sql/04_analytics_examples.sql) show the intended calculations:
+
+- **Table users:** Count distinct non-null authenticated principals with observed `READ` access on `FINISHED` executions. Service accounts count as principals. Check access completeness when interpreting the result.
+
+- **Team resources:** Sum CPU time and physical input bytes from `fact_query_execution`, including `FINISHED`, `FAILED`, and `CANCELED` executions. Keep unmapped workloads visible. Peak memory is a per-query maximum, so report a maximum or distribution rather than a sum.
+
+- **Historical trends:** Group by execution date and team, or by table and date. Do not sum daily distinct-user counts to get a period-wide count.
+
+Timestamps are normalized to UTC and stored as `TIMESTAMP(6)` without time zone. Reporting windows use half-open intervals, `[start, end)`. Late events are reported by query end time, not ingestion time.
+
+## Running the reference SQL
+
+**Prerequisites:** A reachable Trino instance with an Iceberg catalog named `iceberg`, permission to create the three schemas, and a source adapter that produces the normalized staging contract. The SQL files do not provide a complete raw-source adapter or automated integration test.
+
+```bash
+export TRINO_SERVER="http://localhost:8080"
+trino --server "$TRINO_SERVER" --file sql/00_schema.sql
+```
+
+Load approved team mappings and an event batch into `meta_staging.query_events`. The [`sql/00b_ingest_adapter_template.sql`](sql/00b_ingest_adapter_template.sql) uses placeholders because the raw Trino event fields were not provided. It cannot be executed unchanged. The [`sql/00c_team_mapping_example.sql`](sql/00c_team_mapping_example.sql) is illustrative, not authoritative ownership data.
+
+For each batch, run these steps in order:
+
+1. **Preflight:** Replace `__BATCH_SEQ__` in `sql/01_preflight.sql` and run it. Stop if it returns any rows. A zero Trino CLI exit code is not sufficient validation.
+
+1. **Publish:** Run `sql/02_transform.sql` with the same batch sequence.
+
+1. **Post-write checks:** Run `sql/05_post_write_checks.sql`. Stop if it returns any rows.
+
+1. **Checkpoint:** Replace `__BATCH_SEQ__` and `__BATCH_ID__` in `sql/03_advance_checkpoint.sql`. The batch ID must be a quoted SQL string, such as `'batch_001'`. Confirm exactly one row was updated.
+
+For example, to prepare preflight for batch sequence 1:
+
+```bash
+BATCH_SEQ=1
+sed "s/__BATCH_SEQ__/${BATCH_SEQ}/g" sql/01_preflight.sql > /tmp/preflight.sql
+trino --server "$TRINO_SERVER" --file /tmp/preflight.sql
+```
+
+This prints the validation results but does not automatically abort the workflow if rows are returned. A production runner must check the results, stop on violations, serialize publishers, and verify checkpoint updates.
+
+## Limits and next steps
+
+Before production use, validate the model and SQL on the intended Trino/Iceberg deployment. Test duplicate deliveries, same-version conflicts, higher-version corrections, incomplete accesses, changes in team ownership, updates that move a query between date partitions, checkpoint retries, and hash-contract upgrades. Production deployment also needs access controls, identity protection, monitoring, retention rules, and an assigned owner.
+
+The goal is straightforward: count each execution's resource use once, make table access easy to analyze, and show where the data or attribution is incomplete.
