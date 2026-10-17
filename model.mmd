@@ -1,0 +1,9 @@
+flowchart LR
+  A[Raw Trino Iceberg event tables] --> B[Ingestion and normalization]
+  B --> C[meta_staging.query_events<br/>one delivered revision]
+  M[meta_ops.workload_team_map<br/>effective-dated workload ownership] --> D
+  C --> D[meta_core.fact_query_execution<br/>one current row per cluster/query]
+  D --> E[meta_core.v_query_table_access<br/>one query/table/role row]
+  D --> F[Team resource totals and daily trends]
+  E --> G[Distinct observed users per table/period]
+  H[meta_ops.pipeline_checkpoint<br/>last validated batch] -. serialized sequence gate .-> B
